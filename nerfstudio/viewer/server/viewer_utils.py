@@ -48,7 +48,6 @@ from nerfstudio.models.base_model import Model
 from nerfstudio.utils import colormaps, profiler, writer
 from nerfstudio.utils.decorators import check_main_thread, decorate_all
 from nerfstudio.utils.io import load_from_json, write_to_json
-from nerfstudio.utils.misc import get_dict_to_torch
 from nerfstudio.utils.writer import GLOBAL_BUFFER, EventName, TimeWriter
 from nerfstudio.viewer.server.subprocess import run_viewer_bridge_server_as_subprocess
 from nerfstudio.viewer.server.utils import (
@@ -147,7 +146,14 @@ class RenderThread(threading.Thread):
         try:
             with SetTrace(self.state.check_interrupt):
                 if self.state.prev_crop_enabled:
-                    with renderers.background_mode_override_context("black"), torch.no_grad():
+                    color = self.state.prev_crop_bg_color
+                    if color is None:
+                        background_color = torch.tensor([0.0, 0.0, 0.0], device=self.graph.device)
+                    else:
+                        background_color = torch.tensor(
+                            [color["r"] / 255.0, color["g"] / 255.0, color["b"] / 255.0], device=self.graph.device
+                        )
+                    with renderers.background_color_override_context(background_color), torch.no_grad():
                         outputs = self.graph.get_outputs_for_camera_ray_bundle(self.camera_ray_bundle)
                 else:
                     with torch.no_grad():
@@ -156,7 +162,6 @@ class RenderThread(threading.Thread):
             self.exc = e
 
         if outputs:
-            outputs = get_dict_to_torch(outputs)
             self.vis_outputs = outputs
 
         self.state.check_done_render = True
@@ -189,11 +194,16 @@ class CheckThread(threading.Thread):
         while not self.state.check_done_render:
             # check camera
             data = self.state.vis["renderingState/camera"].read()
+            render_time = self.state.vis["renderingState/render_time"].read()
             if data is not None:
                 camera_object = data["object"]
-                if self.state.prev_camera_matrix is None or (
-                    not np.allclose(camera_object["matrix"], self.state.prev_camera_matrix)
-                    and not self.state.prev_moving
+                if (
+                    self.state.prev_camera_matrix is None
+                    or (
+                        not np.allclose(camera_object["matrix"], self.state.prev_camera_matrix)
+                        and not self.state.prev_moving
+                    )
+                    or (render_time is not None and render_time != self.state.prev_render_time)
                 ):
                     self.state.check_interrupt_vis = True
                     self.state.prev_moving = True
@@ -273,6 +283,7 @@ class ViewerState:
 
         # viewer specific variables
         self.prev_camera_matrix = None
+        self.prev_render_time = 0
         self.prev_output_type = OutputTypes.INIT
         self.prev_colormap_type = ColormapTypes.INIT
         self.prev_moving = False
@@ -286,6 +297,7 @@ class ViewerState:
         self.camera_moving = False
         self.prev_camera_timestamp = 0
         self.prev_crop_enabled = False
+        self.prev_crop_bg_color = None
         self.prev_crop_scale = None
         self.prev_crop_center = None
 
@@ -380,6 +392,22 @@ class ViewerState:
             write_to_json(Path(os.path.join(camera_paths_directory, camera_path_filename)), camera_path)
             self.vis["camera_path_payload"].delete()
 
+    def _check_populate_paths_payload(self, trainer, step: int):
+        populate_paths_payload = self.vis["populate_paths_payload"].read()
+        if populate_paths_payload:
+            # save a model checkpoint
+            trainer.save_checkpoint(step)
+            # get all camera paths
+            camera_path_dir = os.path.join(self.datapath, "camera_paths")
+            if os.path.exists(camera_path_dir):
+                camera_path_files = os.listdir(camera_path_dir)
+                all_path_dict = {}
+                for i in camera_path_files:
+                    if i[-4:] == "json":
+                        all_path_dict[i[:-5]] = load_from_json(Path(os.path.join(camera_path_dir, i)))
+                self.vis["renderingState/all_camera_paths"].write(all_path_dict)
+                self.vis["populate_paths_payload"].delete()
+
     def _check_webrtc_offer(self):
         """Check if there is a webrtc offer to respond to."""
         data = self.vis["webrtc/offer"].read()
@@ -412,12 +440,18 @@ class ViewerState:
         if crop_enabled != self.prev_crop_enabled:
             self.camera_moving = True
             self.prev_crop_enabled = crop_enabled
+            self.prev_crop_bg_color = None
             self.prev_crop_scale = None
             self.prev_crop_center = None
 
         if crop_enabled:
             crop_scale = self.vis["renderingState/crop_scale"].read()
             crop_center = self.vis["renderingState/crop_center"].read()
+            crop_bg_color = self.vis["renderingState/crop_bg_color"].read()
+
+            if crop_bg_color != self.prev_crop_bg_color:
+                self.camera_moving = True
+                self.prev_crop_bg_color = crop_bg_color
 
             if crop_scale != self.prev_crop_scale or crop_center != self.prev_crop_center:
                 self.camera_moving = True
@@ -449,7 +483,6 @@ class ViewerState:
             step: iteration step of training
             graph: the current checkpoint of the model
         """
-
         has_temporal_distortion = getattr(graph, "temporal_distortion", None) is not None
         self.vis["model/has_temporal_distortion"].write(str(has_temporal_distortion).lower())
 
@@ -457,6 +490,7 @@ class ViewerState:
         self.step = step
 
         self._check_camera_path_payload(trainer, step)
+        self._check_populate_paths_payload(trainer, step)
         self._check_webrtc_offer()
 
         camera_object = self._get_camera_object()
@@ -501,6 +535,7 @@ class ViewerState:
                     self._render_image_in_viewer(camera_object, graph, is_training)
                     camera_object = self._get_camera_object()
                 is_training = self.vis["renderingState/isTraining"].read()
+                self._check_populate_paths_payload(trainer, step)
                 self._check_camera_path_payload(trainer, step)
                 self._check_webrtc_offer()
                 run_loop = not is_training
@@ -523,12 +558,23 @@ class ViewerState:
             return None
 
         camera_object = data["object"]
+        render_time = self.vis["renderingState/render_time"].read()
 
-        if self.prev_camera_matrix is not None and np.allclose(camera_object["matrix"], self.prev_camera_matrix):
-            self.camera_moving = False
+        if render_time is not None:
+            if (
+                self.prev_camera_matrix is not None and np.allclose(camera_object["matrix"], self.prev_camera_matrix)
+            ) and (self.prev_render_time == render_time):
+                self.camera_moving = False
+            else:
+                self.prev_camera_matrix = camera_object["matrix"]
+                self.prev_render_time = render_time
+                self.camera_moving = True
         else:
-            self.prev_camera_matrix = camera_object["matrix"]
-            self.camera_moving = True
+            if self.prev_camera_matrix is not None and np.allclose(camera_object["matrix"], self.prev_camera_matrix):
+                self.camera_moving = False
+            else:
+                self.prev_camera_matrix = camera_object["matrix"]
+                self.camera_moving = True
 
         output_type = self.vis["renderingState/output_choice"].read()
         if output_type is None:
@@ -541,6 +587,11 @@ class ViewerState:
             colormap_type = ColormapTypes.INIT
         if self.prev_colormap_type != colormap_type:
             self.camera_moving = True
+
+        crop_bg_color = self.vis["renderingState/crop_bg_color"].read()
+        if self.prev_crop_enabled:
+            if self.prev_crop_bg_color != crop_bg_color:
+                self.camera_moving = True
 
         crop_scale = self.vis["renderingState/crop_scale"].read()
         if self.prev_crop_enabled:
@@ -866,10 +917,6 @@ class ViewerState:
             dim=0,
         )
 
-        times = self.vis["renderingState/render_time"].read()
-        if times is not None:
-            times = torch.tensor([float(times)])
-
         camera_type_msg = camera_object["camera_type"]
         if camera_type_msg == "perspective":
             camera_type = CameraType.PERSPECTIVE
@@ -887,7 +934,7 @@ class ViewerState:
             cy=intrinsics_matrix[1, 2],
             camera_type=camera_type,
             camera_to_worlds=camera_to_world[None, ...],
-            times=times,
+            times=torch.tensor([float(self.prev_render_time)]),
         )
         camera = camera.to(graph.device)
 
