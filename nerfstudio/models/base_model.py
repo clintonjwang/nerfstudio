@@ -185,6 +185,26 @@ class Model(nn.Module):
             outputs[output_name] = torch.cat(outputs_list).view(image_height, image_width, -1)  # type: ignore
         return outputs
 
+    @torch.enable_grad()
+    def get_outputs_for_camera_ray_bundle_grad(self, camera_ray_bundle: RayBundle) -> Dict[str, torch.Tensor]:
+        num_rays_per_chunk = self.config.eval_num_rays_per_chunk
+        image_height, image_width = camera_ray_bundle.origins.shape[:2]
+        num_rays = len(camera_ray_bundle)
+        outputs_lists = defaultdict(list)
+        for i in range(0, num_rays, num_rays_per_chunk):
+            start_idx = i
+            end_idx = i + num_rays_per_chunk
+            ray_bundle = camera_ray_bundle.get_row_major_sliced_ray_bundle(start_idx, end_idx)
+            outputs = self.forward(ray_bundle=ray_bundle)
+            for output_name, output in outputs.items():  # type: ignore
+                outputs_lists[output_name].append(output)
+        outputs = {}
+        for output_name, outputs_list in outputs_lists.items():
+            if not torch.is_tensor(outputs_list[0]):
+                continue
+            outputs[output_name] = torch.cat(outputs_list).view(image_height, image_width, -1)  # type: ignore
+        return outputs
+
     @abstractmethod
     def get_image_metrics_and_images(
         self, outputs: Dict[str, torch.Tensor], batch: Dict[str, torch.Tensor]
