@@ -59,28 +59,8 @@ class UNet2DConditionOutput:
     sample: torch.FloatTensor
 
 
-class _SDSGradient(torch.autograd.Function):  # pylint: disable=abstract-method
-    """Custom gradient function for SDS loss. Since it is already computed, we can just return it."""
-
-    @staticmethod
-    @custom_fwd
-    def forward(ctx, input_tensor, gt_grad):  # pylint: disable=arguments-differ
-        del input_tensor
-        ctx.save_for_backward(gt_grad)
-        # Return magniture of gradient, not the actual loss.
-        return torch.mean(gt_grad**2) ** 0.5
-
-    @staticmethod
-    @custom_bwd
-    def backward(ctx, grad):  # pylint: disable=arguments-differ
-        del grad
-        (gt_grad,) = ctx.saved_tensors
-        batch_size = len(gt_grad)
-        return gt_grad / batch_size, None
-
-
-class StableDiffusion(nn.Module):
-    """Stable Diffusion implementation
+class StableDiffusionImg2Img(nn.Module):
+    """Stable Diffusion Img2Img implementation
     Args:
         device: device to use
         num_train_timesteps: number of training timesteps
@@ -113,10 +93,12 @@ class StableDiffusion(nn.Module):
 
         sd_id = SD_IDENTIFIERS[version]
         pipe = StableDiffusionPipeline.from_pretrained(sd_id, torch_dtype=torch.float16)
+        print('SD Pipe Loaded')
         assert pipe is not None
         pipe = pipe.to(self.device)
 
         pipe.enable_attention_slicing()
+        pipe.enable_xformers_memory_efficient_attention()
 
         # use jitted unet
         filename_sd_id = sd_id.split("/")[-1]
@@ -140,6 +122,7 @@ class StableDiffusion(nn.Module):
 
             self.unet = TracedUNet()
             del pipe.unet
+
         else:
             CONSOLE.print("[bold yellow] Warning: Loading UNet without JIT acceleration.")
             CONSOLE.print(f"Run [yellow]ns-trace-sd --sd-version {version} [/yellow] for a speedup!")
@@ -149,7 +132,7 @@ class StableDiffusion(nn.Module):
         self.tokenizer = pipe.tokenizer
         self.text_encoder = pipe.text_encoder
         self.auto_encoder = pipe.vae
-
+        
         CONSOLE.print("Stable Diffusion loaded!")
 
     def get_text_embeds(
@@ -349,6 +332,30 @@ class StableDiffusion(nn.Module):
         latents = posterior.sample() * CONST_SCALE
 
         return latents
+
+    def update_img(self, prompt, negative_prompt, image, num_inference_steps, guidance_scale):
+        prompt = [prompt] if isinstance(prompt, str) else prompt
+        negative_prompt = [negative_prompt] if isinstance(negative_prompt, str) else negative_prompt
+        text_embeddings = self.get_text_embeds(prompt, negative_prompt)
+
+        # image = F.interpolate(image.half(), (IMG_DIM, IMG_DIM), mode="bilinear")
+        init_latents = self.imgs_to_latent(image.half())
+
+        latents = self.produce_latents(
+            text_embeddings,
+            height=IMG_DIM,
+            width=IMG_DIM,
+            latents=init_latents,
+            num_inference_steps=num_inference_steps,
+            guidance_scale=guidance_scale,
+        )  # [1, 4, resolution, resolution]
+
+        diffused_img = self.latents_to_img(latents.half())
+        # diffused_img = F.interpolate(diffused_img, (128, 128), mode="bilinear")
+        diffused_img = diffused_img.detach().cpu().permute(0, 2, 3, 1).numpy()
+        diffused_img = (diffused_img * 255).round().astype("uint8")[0] # might delete this indexing
+
+        return diffused_img
 
     def prompt_to_img(
         self,
